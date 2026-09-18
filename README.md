@@ -1,22 +1,37 @@
 # yii2-queue-redis-ng
 
-A Redis driver for [yii2-queue](https://github.com/yiisoft/yii2-queue) that adds what the stock
-Redis driver lacks, as a drop-in replacement:
+[![tests](https://github.com/ldkafka/yii2-queue-redis-ng/actions/workflows/tests.yml/badge.svg)](https://github.com/ldkafka/yii2-queue-redis-ng/actions/workflows/tests.yml)
+[![Latest Stable Version](https://poser.pugx.org/ldkafka/yii2-queue-redis-ng/v/stable.svg)](https://packagist.org/packages/ldkafka/yii2-queue-redis-ng)
+[![License](https://poser.pugx.org/ldkafka/yii2-queue-redis-ng/license.svg)](LICENSE)
 
-- **Job priority.** `->priority()` works, alone or combined with `->delay()`. The stock driver
-  throws `NotSupportedException`.
-- **Crash-safe reservation.** Taking a job and recording the reservation is one atomic step. The
-  stock driver pops the job first and records it afterwards; a worker killed, or a connection
-  dropped, between the two loses the job for good.
-- **Predictable order.** One documented rule for new, delayed and retried jobs, with options.
-- **No starvation, if you want it.** Optional aging bounds how long a less urgent job can be
-  overtaken.
-- **Fewer round trips.** A push is one call to Redis instead of three, a reservation one instead
-  of five or six.
+**The Redis driver for [yii2-queue](https://github.com/yiisoft/yii2-queue), done again: job
+priorities, no lost jobs, a predictable order, and up to 4× the throughput. Change one line of
+configuration to use it.**
 
-Same component, same console commands (`queue/listen`, `queue/run`, `queue/info`, …), same Redis
-keys for messages, attempts, delayed and reserved jobs. Jobs already queued by the stock driver
-are picked up as they are.
+```php
+'queue' => [
+    'class' => \ldkafka\queue\redis\Queue::class, // was \yii\queue\redis\Queue::class
+    // everything else stays as it is
+],
+```
+
+| | Stock Redis driver | This driver |
+|---|---|---|
+| `->priority()` | throws `NotSupportedException` | any integer from 0 to 9000, also combined with `->delay()` |
+| Worker killed, or connection dropped, while taking a job | **the job is lost**: it is popped first and recorded afterwards | impossible: taking and recording a job is one atomic step |
+| Crash during a push or an acknowledge | orphaned data left in Redis | nothing left behind: each is one atomic step |
+| Order of delayed and retried jobs | jump in front of the whole queue, in scrambled order under load | one documented rule, configurable |
+| Low priorities under sustained load | — | strict priority, or optional **aging** so that no job ever starves |
+| Calls to Redis per job (push, reserve, acknowledge) | 11 or more | 3 |
+| Throughput | 1× | **1.6× to 2.5×** on push, **2.4× to 4×** on reserve and acknowledge ([measured](#performance)) |
+| Clock for due times and timeouts | each PHP host's own | the Redis server's: host clock differences cannot reorder jobs |
+| `queue/listen`, `queue/run`, `queue/info`, `queue/remove`, `queue/clear` | yes | the same commands |
+| Jobs already in the queue when you switch | | picked up as they are, and handed back by `flatten()` if you switch back |
+
+It is a subclass of the stock driver that keeps its Redis keys for messages, attempts, delayed and
+reserved jobs, and replaces the list of waiting jobs by a sorted set driven by six small Lua
+scripts. About 250 lines of PHP, no dependencies beyond yii2-queue and yii2-redis, and a test suite
+that runs real worker processes against Redis 5.0 to 8 and Valkey.
 
 ## Requirements
 
@@ -190,11 +205,25 @@ The scripts are in [`src/lua`](src/lua). They are sent once and then called by t
 
 ## Performance
 
-A push costs `O(log n)` in a sorted set instead of `O(1)` in a list, which is around twenty steps
-for a million waiting jobs and does not show next to a network round trip. Round trips are what
-changes: on a latency-bound development machine this driver pushed about 2.5 times and
-reserved-and-acknowledged about 4 times as many jobs per second as the stock driver, with or
-without priorities. On a low-latency link the gap is smaller.
+Jobs per second, one PHP 8.4 process, 20,000 jobs, best of three runs, Redis 8:
+
+| | Push | Reserve and acknowledge |
+|---|---|---|
+| **Loopback** (PHP and Redis on the same Linux host) | | |
+| Stock driver | 5,960 | 1,906 |
+| This driver | 9,328 (**1.6×**) | 4,667 (**2.4×**) |
+| This driver, random priorities | 9,002 | 4,694 |
+| **Latency-bound link** (PHP on Windows, Redis in a WSL 2 container) | | |
+| Stock driver | 762 | 275 |
+| This driver | 1,913 (**2.5×**) | 1,112 (**4×**) |
+| This driver, random priorities | 2,185 | 1,095 |
+
+The gain comes from round trips. The stock driver makes three calls to push a job and eight or more to
+reserve and acknowledge one; this driver makes one for each step, and the slower the link to Redis,
+the more that is worth. What the sorted set costs in return is an `O(log n)` insert instead of
+`O(1)`, around twenty steps inside Redis for a million waiting jobs, which does not show: pushing
+with random priorities is as fast as pushing without. Figures include PHP serialization and the
+yii2-queue events, and will differ on your hardware; the ratios are the point.
 
 ## Testing
 
